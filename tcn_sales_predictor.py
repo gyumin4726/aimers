@@ -343,7 +343,10 @@ def train_menu_model(menu_data, menu_name, device):
     
     # 학습
     model.train()
-    for epoch in range(30):  # 각 메뉴별로 30 에포크
+    num_epochs = 30
+    for epoch in range(num_epochs):  # 각 메뉴별로 30 에포크
+        epoch_loss = 0.0
+        num_batches = 0
         # 배치 학습
         for i in range(0, len(X_tensor), 16):
             batch_x_ctx = X_tensor[i:i+16, :28, 0:1] # (batch_size, 28, 1)
@@ -355,6 +358,12 @@ def train_menu_model(menu_data, menu_name, device):
             loss = criterion(predictions, y_tensor[i:i+16])
             loss.backward()
             optimizer.step()
+
+            epoch_loss += loss.item()
+            num_batches += 1
+
+        avg_loss = epoch_loss / max(num_batches, 1)
+        print(f"  [{menu_name}] 에포크 {epoch+1}/{num_epochs} - 평균 손실: {avg_loss:.6f}")
     
     # 모델을 eval 모드로 설정
     model.eval()
