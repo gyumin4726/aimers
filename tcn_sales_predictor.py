@@ -257,27 +257,31 @@ def load_processed_data():
     """전처리된 데이터 로드"""
     print("데이터 로드 중...")
     
-    # 원본 train.csv 로드
-    train = pd.read_csv('./data/train/train.csv')
+    # 전처리된 train 데이터 로드
+    train = pd.read_csv('./processed_data/train_processed.csv')
     train['영업일자'] = pd.to_datetime(train['영업일자'])
     
-    # pkl 파일에서 메뉴 정보 로드
-    with open('./processed_data/menu_info.pkl', 'rb') as f:
-        menu_info = pickle.load(f)
-    
-    print(f"총 메뉴 수: {len(menu_info['processed_menus'])}")
+    print(f"총 메뉴 수: {train['영업장명_메뉴명'].nunique()}")
     print(f"총 레코드 수: {len(train)}")
     
-    return train, menu_info
+    return train
 
 
 def create_time_features(dates):
     """날짜에서 시간 특성 생성"""
-    day_of_week = dates.dt.dayofweek
+    # DatetimeIndex인 경우와 Series인 경우를 모두 처리
+    if hasattr(dates, 'dt'):
+        # pandas Series인 경우
+        day_of_week = dates.dt.dayofweek
+        month = dates.dt.month
+    else:
+        # DatetimeIndex인 경우
+        day_of_week = dates.dayofweek
+        month = dates.month
+    
     day_sin = np.sin(2 * np.pi * day_of_week / 7)
     day_cos = np.cos(2 * np.pi * day_of_week / 7)
 
-    month = dates.dt.month
     month_sin = np.sin(2 * np.pi * month / 12)
     month_cos = np.cos(2 * np.pi * month / 12)
 
@@ -312,8 +316,8 @@ def train_menu_model(menu_data, menu_name, device):
     # 매출수량만 추출
     sales_data = menu_df['매출수량'].values
     
-    # 시간 특성 생성
-    time_features = create_time_features(menu_df['영업일자'])
+    # 전처리된 시간 특성 사용
+    time_features = menu_df[['day_sin', 'day_cos', 'month_sin', 'month_cos']].values
     
     # 슬라이딩 윈도우 생성
     X, y = create_sliding_windows(sales_data, time_features, window_size=35, stride=1)
@@ -368,7 +372,7 @@ def main():
     print("변수 간 상관관계 학습 가능!")
     
     # 데이터 로드
-    train_data, menu_info = load_processed_data()
+    train_data = load_processed_data()
     
     # 디바이스 설정
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -396,30 +400,57 @@ def main():
 
 
 def predict_menu_sales(test_df, trained_models, test_prefix):
-    """메뉴별 매출 예측"""
+    """메뉴별 매출 예측 - 전처리된 데이터 사용"""
     results = []
-    device = next(iter(trained_models.values()))['model'].device
+    # 첫 번째 모델에서 device 정보 가져오기
+    first_model = next(iter(trained_models.values()))['model']
+    device = next(first_model.parameters()).device
     
-    for store_menu, store_test in test_df.groupby(['영업장명_메뉴명']):
-        if store_menu not in trained_models:
+    # 디버깅: 매칭 정보 출력
+    test_menus = test_df['영업장명_메뉴명'].unique()
+    trained_menu_keys = set(trained_models.keys())
+    matching_menus = set(test_menus) & trained_menu_keys
+    
+    print(f"   테스트 메뉴 수: {len(test_menus)}")
+    print(f"   학습된 모델 수: {len(trained_menu_keys)}")
+    print(f"   매칭되는 메뉴 수: {len(matching_menus)}")
+    
+    # 매칭되지 않는 메뉴들 출력 (처음 5개)
+    non_matching = set(test_menus) - trained_menu_keys
+    if non_matching:
+        print(f"   매칭되지 않는 테스트 메뉴들 (처음 5개):")
+        for i, menu in enumerate(list(non_matching)[:5]):
+            print(f"    {i+1}. '{menu}'")
+    
+    processed_count = 0
+    for menu_name, menu_data in test_df.groupby('영업장명_메뉴명'):
+        if menu_name not in trained_models:
             continue
             
-        model_info = trained_models[store_menu]
+        model_info = trained_models[menu_name]
         model = model_info['model']
         
         # 테스트 데이터 정렬
-        store_test_sorted = store_test.sort_values('영업일자')
+        menu_data_sorted = menu_data.sort_values('영업일자')
         
-        # 최근 28일 데이터 추출
-        recent_sales = store_test_sorted['매출수량'].values[-28:]
-        recent_dates = store_test_sorted['영업일자'].values[-28:]
+        # 전처리된 데이터에서 필요한 컬럼들 추출
+        recent_sales = menu_data_sorted['매출수량'].values
+        recent_dates = menu_data_sorted['영업일자'].values
         
-        if len(recent_sales) < 28:
+        # 디버깅: 데이터 길이 확인
+        if len(recent_sales) != 28:
+            print(f"      {menu_name}: 데이터 길이 {len(recent_sales)} (예상: 28)")
             continue
         
-        # 시간 특성 생성
-        recent_dates = pd.to_datetime(recent_dates)
-        time_features = create_time_features(recent_dates)
+        # 디버깅: 첫 번째 메뉴의 데이터 길이만 출력
+        if processed_count == 0:
+            print(f"     첫 번째 메뉴 '{menu_name}' 데이터 길이: {len(recent_sales)}")
+            print(f"     첫 번째 메뉴 날짜 범위: {recent_dates[0]} ~ {recent_dates[-1]}")
+            print(f"     첫 번째 메뉴 데이터 샘플: {recent_sales[:5]}...")
+            print(f"     첫 번째 메뉴 데이터 길이 확인: {len(recent_sales)} == 28? {len(recent_sales) == 28}")
+        
+        # 전처리된 시간 특성 사용
+        time_features = menu_data_sorted[['day_sin', 'day_cos', 'month_sin', 'month_cos']].values
         
         # 입력 데이터 준비 - Seq2Seq용
         # 28일 과거 데이터
@@ -427,8 +458,25 @@ def predict_menu_sales(test_df, trained_models, test_prefix):
         m_ctx = torch.FloatTensor(time_features).unsqueeze(0).to(device)  # (1, 28, 4)
         
         # 7일 미래 시간특성 (예측 시점의 시간특성)
-        future_dates = pd.date_range(recent_dates[-1] + pd.Timedelta(days=1), periods=7, freq='D')
-        future_time_features = create_time_features(future_dates)
+        # 마지막 날짜에서 7일 후까지의 시간 특성 생성
+        last_date = pd.to_datetime(recent_dates[-1])
+        future_dates = pd.date_range(last_date + pd.Timedelta(days=1), periods=7, freq='D')
+        
+        # 미래 시간 특성 생성 (순차적으로 요일 할당)
+        first_future_day = future_dates[0].dayofweek
+        future_time_features = []
+        
+        for i in range(7):
+            current_day = (first_future_day + i) % 7
+            current_month = future_dates[i].month
+            
+            day_sin = np.sin(2 * np.pi * current_day / 7)
+            day_cos = np.cos(2 * np.pi * current_day / 7)
+            month_sin = np.sin(2 * np.pi * current_month / 12)
+            month_cos = np.cos(2 * np.pi * current_month / 12)
+            
+            future_time_features.append([day_sin, day_cos, month_sin, month_cos])
+        
         m_fut = torch.FloatTensor(future_time_features).unsqueeze(0).to(device)  # (1, 7, 4)
         
         # 예측
@@ -446,20 +494,29 @@ def predict_menu_sales(test_df, trained_models, test_prefix):
         for date, pred_val in zip(pred_dates, pred_values):
             results.append({
                 '영업일자': date,
-                '영업장명_메뉴명': store_menu,
+                '영업장명_메뉴명': menu_name,
                 '매출수량': pred_val
             })
+        
+        processed_count += 1
     
+    print(f"   처리된 메뉴 수: {processed_count}")
+    
+    # Baseline과 동일하게 빈 DataFrame 반환
     return pd.DataFrame(results)
 
 
 def convert_to_submission_format(pred_df, sample_submission):
     """제출 형식으로 변환"""
-    # (영업일자, 메뉴) → 매출수량 딕셔너리로 변환
-    pred_dict = dict(zip(
-        zip(pred_df['영업일자'], pred_df['영업장명_메뉴명']),
-        pred_df['매출수량']
-    ))
+    # 빈 DataFrame 처리
+    if pred_df.empty:
+        pred_dict = {}
+    else:
+        # (영업일자, 메뉴) → 매출수량 딕셔너리로 변환
+        pred_dict = dict(zip(
+            zip(pred_df['영업일자'], pred_df['영업장명_메뉴명']),
+            pred_df['매출수량']
+        ))
 
     final_df = sample_submission.copy()
 
@@ -478,12 +535,26 @@ def run_prediction():
     
     print("=== TCN 모델 예측 시작 ===")
     
-    # 학습된 모델 로드
-    trained_models = torch.load('./tcn_menu_models.pth', map_location='cpu')
-    print(f"로드된 모델 수: {len(trained_models)}")
+    # 학습된 모델 파일 확인
+    model_path = './tcn_menu_models.pth'
+    if not os.path.exists(model_path):
+        print(f" 모델 파일 '{model_path}'을 찾을 수 없습니다!")
+        print("먼저 학습을 실행하여 모델을 생성해주세요.")
+        print("학습을 실행하려면 main() 함수의 주석을 해제하세요.")
+        return
     
-    # 모든 test_*.csv 순회
-    test_files = sorted(glob.glob('./data/test/TEST_*.csv'))
+    # 학습된 모델 로드
+    try:
+        trained_models = torch.load(model_path, map_location='cpu', weights_only=False)
+        print(f" 모델 파일 로드 성공! 로드된 모델 수: {len(trained_models)}")
+    except Exception as e:
+        print(f" 모델 파일 로드 중 오류 발생: {e}")
+        return
+    
+    # 전처리된 test 파일들 순회
+    test_files = sorted(glob.glob('./processed_data/test/TEST_*.csv'))
+    print(f" 처리할 전처리된 테스트 파일 수: {len(test_files)}")
+    
     all_preds = []
     
     for path in test_files:
@@ -493,23 +564,50 @@ def run_prediction():
         filename = os.path.basename(path)
         test_prefix = re.search(r'(TEST_\d+)', filename).group(1)
         
-        print(f"예측 중: {filename}")
+        print(f" 예측 중: {filename}")
         pred_df = predict_menu_sales(test_df, trained_models, test_prefix)
         all_preds.append(pred_df)
+        print(f"    {filename} 예측 완료 (예측 결과: {len(pred_df)}개)")
     
     # 모든 예측 결과 합치기
     full_pred_df = pd.concat(all_preds, ignore_index=True)
+    print(f" 총 예측 결과: {len(full_pred_df)}개")
     
     # 제출 형식으로 변환
     sample_submission = pd.read_csv('./data/sample_submission.csv')
     submission = convert_to_submission_format(full_pred_df, sample_submission)
     
     # 결과 저장
-    submission.to_csv('tcn_submission.csv', index=False, encoding='utf-8-sig')
-    print("예측 완료! 결과가 'tcn_submission.csv'에 저장되었습니다.")
+    output_file = 'tcn_submission.csv'
+    submission.to_csv(output_file, index=False, encoding='utf-8-sig')
+    print(f" 예측 완료! 결과가 '{output_file}'에 저장되었습니다.")
+    print(f" 제출 파일 크기: {len(submission)}행 x {len(submission.columns)}열")
 
+
+def train_only():
+    """학습만 실행"""
+    print("=== TCN 모델 학습 시작 ===")
+    main()
+
+def predict_only():
+    """예측만 실행 (학습된 모델 필요)"""
+    run_prediction()
 
 if __name__ == "__main__":
-    main()
-    # 학습 후 예측도 실행하려면 아래 주석 해제
-    # run_prediction()
+    import sys
+    
+    if len(sys.argv) > 1:
+        mode = sys.argv[1].lower()
+        if mode == "train":
+            train_only()
+        elif mode == "predict":
+            predict_only()
+        else:
+            print("사용법:")
+            print("  python tcn_sales_predictor.py train   # 학습만 실행")
+            print("  python tcn_sales_predictor.py predict # 예측만 실행")
+    else:
+        # 기본값: 예측만 실행 (학습된 모델이 있다고 가정)
+        print("기본 모드: 예측 실행")
+        print("학습을 실행하려면: python tcn_sales_predictor.py train")
+        predict_only()
